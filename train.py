@@ -58,23 +58,18 @@ def main():
     global args, best_prec1
     args = parser.parse_args()
     if args.tensorboard: configure("runs/%s"%(args.name))
-
+    
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    
     # Data loading code
-    normalize = transforms.Normalize(mean=[x/255.0 for x in [125.3, 123.0, 113.9]],
-                                     std=[x/255.0 for x in [63.0, 62.1, 66.7]])
-
     if args.augment:
         transform_train = transforms.Compose([
-        	transforms.ToTensor(),
-        	transforms.Lambda(lambda x: F.pad(
-        						Variable(x.unsqueeze(0), requires_grad=False, volatile=True),
-        						(4,4,4,4),mode='reflect').data.squeeze()),
-            transforms.ToPILImage(),
-            transforms.RandomCrop(32),
+            transforms.RandomCrop( 32, padding=4 ),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            normalize,
-            ])
+            #transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        ])
     else:
         transform_train = transforms.Compose([
             transforms.ToTensor(),
@@ -82,9 +77,10 @@ def main():
             ])
     transform_test = transforms.Compose([
         transforms.ToTensor(),
-        normalize
-        ])
-
+        #transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ])
+    
     kwargs = {'num_workers': 1, 'pin_memory': True}
     assert(args.dataset == 'cifar10' or args.dataset == 'cifar100')
     train_loader = torch.utils.data.DataLoader(
@@ -94,19 +90,19 @@ def main():
     val_loader = torch.utils.data.DataLoader(
         datasets.__dict__[args.dataset.upper()]('../data', train=False, transform=transform_test),
         batch_size=args.batch_size, shuffle=True, **kwargs)
-
+    
     # create model
     model = WideResNet(args.layers, args.dataset == 'cifar10' and 10 or 100,
                             args.widen_factor, dropRate=args.droprate)
-
+    
     # get the number of model parameters
     print('Number of model parameters: {}'.format(
         sum([p.data.nelement() for p in model.parameters()])))
-
+    
     # for training on multiple GPUs.
     # Use CUDA_VISIBLE_DEVICES=0,1 to specify which GPUs to use
     # model = torch.nn.DataParallel(model).cuda()
-    model = model.cuda()
+    model = model.to( device )
     bin_op=binaryconnect.BC(model)
     # optionally resume from a checkpoint
     if args.resume:
@@ -120,24 +116,24 @@ def main():
                   .format(args.resume, checkpoint['epoch']))
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
-
+    
     cudnn.benchmark = True
-
+    
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda()
+    criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum, nesterov = args.nesterov,
                                 weight_decay=args.weight_decay)
-
+    
     for epoch in range(args.start_epoch, args.epochs):
         adjust_learning_rate(optimizer, epoch+1)
-
+        
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch,bin_op)
-
+        train(train_loader, model, criterion, optimizer, epoch, bin_op, device)
+        
         # evaluate on validation set
-        prec1 = validate(val_loader, model, criterion, epoch,bin_op)
-
+        prec1 = validate(val_loader, model, criterion, epoch, bin_op, device)
+        
         # remember best prec@1 and save checkpoint
         is_best = prec1 > best_prec1
         best_prec1 = max(prec1, best_prec1)
@@ -148,31 +144,29 @@ def main():
         }, is_best)
         print("Best accuracy: "+str(best_prec1))
 
-def train(train_loader, model, criterion, optimizer, epoch,bin_op):
+def train(train_loader, model, criterion, optimizer, epoch, bin_op, device):
     """Train for one epoch on the training set"""
     batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
-
+    
     # switch to train mode
     model.train()
-
+    
     end = time.time()
     for i, (input, target) in enumerate(train_loader):
-        target = target.cuda(async=True)
-        input = input.cuda()
-        input_var = torch.autograd.Variable(input)
-        target_var = torch.autograd.Variable(target)
+        input, target = input.to(device), target.to(device)
         bin_op.binarization()
+        
         # compute output
-        output = model(input_var)
-        loss = criterion(output, target_var)
-
+        output = model(input)
+        loss = criterion(output, target)
+        
         # measure accuracy and record loss
         prec1 = accuracy(output.data, target, topk=(1,))[0]
-        losses.update(loss.data[0], input.size(0))
-        top1.update(prec1[0], input.size(0))
-
+        losses.update(loss.item(), input.size(0))
+        top1.update(prec1.item(), input.size(0))
+        
         # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
@@ -182,7 +176,7 @@ def train(train_loader, model, criterion, optimizer, epoch,bin_op):
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
-
+        
         if i % args.print_freq == 0:
             print('Epoch: [{0}][{1}/{2}]\t'
                   'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
@@ -195,43 +189,41 @@ def train(train_loader, model, criterion, optimizer, epoch,bin_op):
         log_value('train_loss', losses.avg, epoch)
         log_value('train_acc', top1.avg, epoch)
 
-def validate(val_loader, model, criterion, epoch,bin_op):
+def validate(val_loader, model, criterion, epoch, bin_op, device):
     """Perform validation on the validation set"""
     batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
-
+    
     # switch to evaluate mode
     model.eval()
-
+    
     end = time.time()
     bin_op.binarization()
-    for i, (input, target) in enumerate(val_loader):
-        target = target.cuda(async=True)
-        input = input.cuda()
-        input_var = torch.autograd.Variable(input, volatile=True)
-        target_var = torch.autograd.Variable(target, volatile=True)
-
-        # compute output
-        output = model(input_var)
-        loss = criterion(output, target_var)
-
-        # measure accuracy and record loss
-        prec1 = accuracy(output.data, target, topk=(1,))[0]
-        losses.update(loss.data[0], input.size(0))
-        top1.update(prec1[0], input.size(0))
-
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
-
-        if i % args.print_freq == 0:
-            print('Test: [{0}/{1}]\t'
-                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
-                      i, len(val_loader), batch_time=batch_time, loss=losses,
-                      top1=top1))
+    with torch.no_grad():
+        for i, (input, target) in enumerate(val_loader):
+            input, target = input.to(device), target.to(device)
+            
+            # compute output
+            output = model(input)
+            loss = criterion(output, target)
+            
+            # measure accuracy and record loss
+            prec1 = accuracy(output.data, target, topk=(1,))[0]
+            losses.update(loss.item(), input.size(0))
+            top1.update(prec1.item(), input.size(0))
+            
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+            
+            if i % args.print_freq == 0:
+                print('Test: [{0}/{1}]\t'
+                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                      'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
+                          i, len(val_loader), batch_time=batch_time, loss=losses,
+                          top1=top1))
 
     bin_op.restore()
     print(' * Prec@1 {top1.avg:.3f}'.format(top1=top1))
@@ -272,7 +264,7 @@ class AverageMeter(object):
 
 def adjust_learning_rate(optimizer, epoch):
     """Sets the learning rate to the initial LR divided by 5 at 60th, 120th and 160th epochs"""
-    lr = args.lr * ((0.2 ** int(epoch >= 60)) * (0.2 ** int(epoch >= 120))* (0.2 ** int(epoch >= 160)))
+    lr = args.lr * ( (0.2 ** int(epoch >= 60)) * (0.2 ** int(epoch >= 120)) * (0.2 ** int(epoch >= 160)) )
     # log to TensorBoard
     if args.tensorboard:
         log_value('learning_rate', lr, epoch)
@@ -286,7 +278,8 @@ def accuracy(output, target, topk=(1,)):
 
     _, pred = output.topk(maxk, 1, True, True)
     pred = pred.t()
-    correct = pred.eq(target.view(1, -1).expand_as(pred))
+    correct = (pred == target).sum().item()
+    #correct = pred.eq(target.view(1, -1).expand_as(pred))
 
     res = []
     for k in topk:
